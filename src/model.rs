@@ -1091,6 +1091,13 @@ pub enum Dialog {
     PremiumNeeded,
     /// Introduce personal Spotify apps to eligible listeners once.
     PersonalAppIntro,
+    /// Sign in to Last.fm: open the authorization URL, then confirm.
+    LastFmSignIn {
+        /// The listener's Last.fm API key.
+        api_key: String,
+        /// The URL to open in the browser to grant access.
+        auth_url: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,0 +1,94 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native"
+
+jobs:
+  build:
+    name: Build and package macOS DMG
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "macos-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}"
+          shared-key: "macos-${{ runner.os }}-"
+
+      - name: Install system dependencies
+        run: |
+          brew install cmake pkg-config
+
+      - name: Build release binary
+        run: |
+          cargo build --release --locked
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create .app bundle
+        id: bundle
+        run: |
+          BINARY=target/release/spotifast
+          APP=target/release/Spotifast.app
+          VERSION=${{ steps.version.outputs.version }}
+          chmod +x packaging/macos/bundle.sh
+          packaging/macos/bundle.sh "$BINARY" "$APP" "$VERSION"
+          echo "app=$APP" >> $GITHUB_OUTPUT
+
+      - name: Create DMG
+        id: dmg
+        run: |
+          APP=${{ steps.bundle.outputs.app }}
+          VERSION=${{ steps.version.outputs.version }}
+          DMG="target/release/Spotifast-${VERSION}-macos.dmg"
+          ruby packaging/macos/dmg.rb "$APP" "$DMG"
+          echo "dmg=$DMG" >> $GITHUB_OUTPUT
+
+      - name: Verify DMG
+        run: |
+          DMG=${{ steps.dmg.outputs.dmg }}
+          hdiutil verify "$DMG"
+          ls -lh "$DMG"
+
+      - name: Upload DMG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spotifast-macos
+          path: ${{ steps.dmg.outputs.dmg }}
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dmg.outputs.dmg }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false

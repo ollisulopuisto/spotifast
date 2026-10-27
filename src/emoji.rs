@@ -9,7 +9,7 @@
 //! Without a colour emoji font (a Linux desktop with none installed) the
 //! bundled monochrome face draws the emoji, as it always has.
 
-/// Chooses the platform's emoji font and starts finding it off this thread.
+/// Chooses the platform's emoji font and warms it up before the first frame.
 /// `synchronous` draws each picture in the frame that first shows it, for
 /// demo captures that must show every emoji in their first frame.
 pub fn install(synchronous: bool) {
@@ -17,5 +17,8 @@ pub fn install(synchronous: bool) {
         .system(true)
         .synchronous(synchronous)
         .install();
-    std::thread::spawn(fastframe_emoji::warm_up);
+    // Find and open the emoji fonts now, on this thread, so the first frame
+    // with an emoji does not pay for it and the texture atlas does not grow
+    // while the window is already up.
+    fastframe_emoji::warm_up();
 }

@@ -28,12 +28,19 @@ pub enum Slot {
     Shared,
     Personal,
     Playback,
+    LastFm,
     Proxy,
 }
 
 impl Slot {
     pub const SPOTIFY: [Self; 3] = [Self::Shared, Self::Personal, Self::Playback];
-    pub const ALL: [Self; 4] = [Self::Shared, Self::Personal, Self::Playback, Self::Proxy];
+    pub const ALL: [Self; 5] = [
+        Self::Shared,
+        Self::Personal,
+        Self::Playback,
+        Self::LastFm,
+        Self::Proxy,
+    ];
     pub(crate) fn index(self) -> usize {
         self as usize
     }
@@ -42,17 +49,20 @@ impl Slot {
             Self::Shared => "shared-web",
             Self::Personal => "personal-web",
             Self::Playback => "playback",
+            Self::LastFm => "last-fm",
             Self::Proxy => "proxy-password",
         }
     }
 }
 
-/// Deliberately has no Debug implementation: it contains usable secrets.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub enum Grant {
-    Web(StoredToken),
-    Playback(Credentials),
-    Proxy(ProxyPassword),
+/// Last.fm credentials: the public API key, the per-user session key, and
+/// the API secret used to sign every request. The secret is private and
+/// stays in the credential store, never in settings.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastFmSession {
+    pub api_key: String,
+    pub session_key: String,
+    pub secret: String,
 }
 
 /// No Debug implementation: the password is usable, and the username is private.
@@ -78,6 +88,15 @@ impl ProxyPassword {
     }
 }
 
+/// The grant kinds stored in the credential store.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub enum Grant {
+    Web(StoredToken),
+    Playback(Credentials),
+    Proxy(ProxyPassword),
+    LastFm(LastFmSession),
+}
+
 impl Grant {
     fn valid_for(&self, slot: Slot) -> bool {
         match (slot, self) {
@@ -93,6 +112,14 @@ impl Grant {
                     .as_deref()
                     .is_some_and(|name| !name.is_empty())
                     && !credentials.auth_data.is_empty()
+            }
+            (
+                Slot::LastFm,
+                Self::LastFm(session),
+            ) => {
+                !session.api_key.is_empty()
+                    && !session.session_key.is_empty()
+                    && !session.secret.is_empty()
             }
             (Slot::Proxy, Self::Proxy(password)) => password.valid(),
             _ => false,
@@ -574,7 +601,7 @@ type Job = Box<dyn FnOnce(&mut dyn ProtectedStore) + Send>;
 struct Inner {
     dirs: AppDirs,
     profile: String,
-    generations: [AtomicU64; 4],
+    generations: [AtomicU64; 5],
     // Held only around the tiny local marker files, never a native store call.
     markers: Mutex<()>,
     jobs: mpsc::SyncSender<Job>,
@@ -787,12 +814,16 @@ impl Store {
             let path = self.inner.dirs.proxy_secret_file();
             return vec![path.clone(), path.with_extension("tmp")];
         }
+        if slot == Slot::LastFm {
+            return Vec::new();
+        }
         let dirs = &self.inner.dirs;
         let path = match slot {
             Slot::Shared => dirs.shared_web_token_file(),
             Slot::Personal => dirs.personal_web_token_file(),
             Slot::Playback => dirs.credentials_dir().join("credentials.json"),
             Slot::Proxy => unreachable!("proxy legacy paths handled above"),
+            Slot::LastFm => unreachable!("last.fm legacy paths handled above"),
         };
         let mut paths = vec![path.clone(), path.with_extension("json.tmp")];
         if slot != Slot::Playback {
@@ -1427,6 +1458,13 @@ mod tests {
             password: " dummy-private-password\n".into(),
         })
     }
+    fn lastfm() -> Grant {
+        Grant::LastFm(LastFmSession {
+            api_key: "dummy-api-key".into(),
+            session_key: "dummy-session-key".into(),
+            secret: "dummy-secret".into(),
+        })
+    }
 
     fn write_legacy(path: &Path, grant: &Grant) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1434,6 +1472,7 @@ mod tests {
             Grant::Web(token) => serde_json::to_vec(token).unwrap(),
             Grant::Playback(credentials) => serde_json::to_vec(credentials).unwrap(),
             Grant::Proxy(password) => password.password.as_bytes().to_vec(),
+            Grant::LastFm(_) => Vec::new(),
         };
         std::fs::write(path, bytes).unwrap();
     }
@@ -1579,6 +1618,7 @@ mod tests {
             web(SHARED_CLIENT),
             web("dummy-personal-client"),
             playback(),
+            lastfm(),
             proxy_password(),
         ];
         for (slot, grant) in Slot::ALL.into_iter().zip(grants.iter()) {
@@ -1673,6 +1713,7 @@ mod tests {
             web(SHARED_CLIENT),
             web("dummy-personal-client"),
             playback(),
+            lastfm(),
             proxy_password(),
         ];
         for (slot, grant) in Slot::ALL.into_iter().zip(grants.iter()) {

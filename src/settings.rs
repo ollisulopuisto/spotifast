@@ -342,6 +342,8 @@ pub struct Settings {
     /// An optional personal Spotify Web API application id. The shared
     /// application remains active for coverage when this is present.
     pub web_client_id: Option<String>,
+    /// The listener's Last.fm API key, for scrobbling plays to Last.fm.
+    pub lastfm_api_key: Option<String>,
     /// Legacy reminder time, retained for older Spotifast versions.
     pub personal_app_nudge_at: Option<String>,
     /// The listener has dismissed or followed the personal-app introduction.
@@ -516,6 +518,7 @@ impl Default for Settings {
             search_history: Vec::new(),
             show_shortcut_hints: true,
             web_client_id: None,
+            lastfm_api_key: None,
             personal_app_nudge_at: None,
             personal_app_intro_seen: false,
             slow_app_banner: SlowAppBanner::default(),

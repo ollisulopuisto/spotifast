@@ -717,6 +717,10 @@ pub enum Command {
         lease: CredentialLease,
         result: Result<crate::credentials::Loaded, crate::credentials::Error>,
     },
+    LastFmRestored {
+        lease: CredentialLease,
+        result: Result<crate::credentials::Loaded, crate::credentials::Error>,
+    },
     CheckPlaylistCover {
         id: String,
         request: u64,
@@ -852,6 +856,23 @@ pub enum Command {
     VerifyResume,
     /// Add, replace, or remove the optional personal Web API application.
     ConfigurePersonalWebApp(Option<String>),
+    /// Start signing in to Last.fm: ask for a token and open the browser.
+    LastFmSignIn {
+        api_key: String,
+        secret: String,
+    },
+    /// Exchange a Last.fm token for a session key, after the user authorized.
+    LastFmExchangeToken {
+        token: String,
+    },
+    /// Tell Last.fm what is playing now.
+    LastFmNowPlaying {
+        now: crate::lastfm::NowPlaying,
+    },
+    /// Scrobble a played track to Last.fm.
+    LastFmScrobble {
+        track: crate::lastfm::Scrobble,
+    },
     /// Read a playlist's cached items from disk.
     LoadPlaylistCache {
         id: String,
@@ -1002,6 +1023,16 @@ pub enum Event {
         result: Result<Option<crate::playlist_cover::Cover>, String>,
     },
     Auth(AuthStatus),
+    /// A Last.fm token received; the app opens the authorization URL.
+    LastFmToken {
+        api_key: String,
+        secret: String,
+        token: String,
+    },
+    /// The Last.fm sign-in completed with a session.
+    LastFmSignedIn(crate::lastfm::Session),
+    /// The Last.fm sign-in failed.
+    LastFmSignInFailed(String),
     Playback(LocalPlayback),
     /// Receivers seen on the local network that Spotify has not listed.
     Receivers(Vec<crate::zeroconf::Receiver>),
@@ -1479,6 +1510,27 @@ impl Backend {
         self.send(Command::Api(request));
     }
 
+    /// Start signing in to Last.fm: request a token and let the listener
+    /// authorize in the browser.
+    pub fn lastfm_sign_in(&self, api_key: String, secret: String) {
+        self.send(Command::LastFmSignIn { api_key, secret });
+    }
+
+    /// Exchange a Last.fm authorization token for a session key.
+    pub fn lastfm_exchange_token(&self, token: String) {
+        self.send(Command::LastFmExchangeToken { token });
+    }
+
+    /// Tell Last.fm what is playing now.
+    pub fn lastfm_now_playing(&self, now: crate::lastfm::NowPlaying) {
+        self.send(Command::LastFmNowPlaying { now });
+    }
+
+    /// Scrobble a played track to Last.fm.
+    pub fn lastfm_scrobble(&self, track: crate::lastfm::Scrobble) {
+        self.send(Command::LastFmScrobble { track });
+    }
+
     #[cfg(test)]
     pub(crate) fn take_playlist_row_removals(
         &self,
@@ -1820,6 +1872,9 @@ struct Worker {
     /// a durable grant has been stored, so recovery can reconnect when the
     /// network returns.
     pending_playback_grant: Option<Credentials>,
+    /// A Last.fm token waiting for the user to authorize in the browser,
+    /// with the API key and secret that will complete the session.
+    lastfm_pending: Option<(String, String, String)>,
     restore_pending: [bool; 3],
     restoring_proxy: bool,
     waiting_for_proxy: VecDeque<Command>,
@@ -1832,6 +1887,8 @@ struct Worker {
     engine_proxy: Option<reqwest::Url>,
     web_client_id: Option<String>,
     http: Http,
+    /// The Last.fm scrobbler, holding the signed-in session if there is one.
+    scrobbler: crate::lastfm::Scrobbler,
     /// Friends' names and avatars and their playlists' names, kept between
     /// Friend activity polls.
     friend_names: Arc<tokio::sync::Mutex<session_reads::FriendNames>>,
@@ -1944,6 +2001,7 @@ impl Worker {
             web_tokens: [None, None],
             playback_grant: None,
             pending_playback_grant: None,
+            lastfm_pending: None,
             restore_pending: [false; 3],
             restoring_proxy: false,
             waiting_for_proxy: VecDeque::new(),
@@ -1961,7 +2019,8 @@ impl Worker {
             connect: Arc::default(),
             receiver_discovery: None,
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
-            http,
+            http: http.clone(),
+            scrobbler: crate::lastfm::Scrobbler::new(http),
             friend_names: Arc::default(),
             art,
             events,
@@ -2131,6 +2190,7 @@ impl Worker {
             return;
         }
         self.restore_spotify_grants();
+        self.restore_lastfm();
         for command in self.waiting_for_proxy.drain(..) {
             let _ = self.commands.send(command);
         }
@@ -2207,6 +2267,129 @@ impl Worker {
                     lease,
                     result,
                 } => self.on_credentials_restored(slot, lease, result),
+                Command::LastFmRestored { lease, result } => {
+                    self.on_lastfm_restored(lease, result);
+                }
+                Command::LastFmSignIn { api_key, secret } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    let http = self.http.clone();
+                    let base_url = self.scrobbler.base_url().to_string();
+                    tokio::spawn(async move {
+                        match crate::lastfm::Scrobbler::request_token(
+                            &http,
+                            &base_url,
+                            &api_key,
+                            &secret,
+                        )
+                        .await
+                        {
+                            Ok(token) => {
+                                let _ = events.send(Event::LastFmToken {
+                                    api_key,
+                                    secret,
+                                    token,
+                                });
+                                waker.wake();
+                            }
+                            Err(error) => {
+                                let _ = events.send(Event::LastFmSignInFailed(error.to_string()));
+                                waker.wake();
+                            }
+                        }
+                    });
+                }
+                Command::LastFmExchangeToken { token } => {
+                    let Some((api_key, secret, pending)) = self.lastfm_pending.take() else {
+                        let _ = self.events.send(Event::LastFmSignInFailed(
+                            "No Last.fm sign-in in progress.".into(),
+                        ));
+                        self.waker.wake();
+                        return;
+                    };
+                    if pending != token {
+                        let _ = self.events.send(Event::LastFmSignInFailed(
+                            "Last.fm token does not match the one requested.".into(),
+                        ));
+                        self.waker.wake();
+                        return;
+                    }
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    let http = self.http.clone();
+                    let base_url = self.scrobbler.base_url().to_string();
+                    let lease = self.credentials.lease(CredentialSlot::LastFm);
+                    tokio::spawn(async move {
+                        match crate::lastfm::Scrobbler::session_for_token(
+                            &http,
+                            &base_url,
+                            &api_key,
+                            &secret,
+                            &token,
+                        )
+                        .await
+                        {
+                            Ok(session) => {
+                                let grant = crate::credentials::Grant::LastFm(
+                                    crate::credentials::LastFmSession {
+                                        api_key: session.api_key.clone(),
+                                        session_key: session.session_key.clone(),
+                                        secret: session.secret.clone(),
+                                    },
+                                );
+                                let saving = lease.save(grant);
+                                let scrobbler_session = session;
+                                let _ = saving.await;
+                                let _ = events.send(Event::LastFmSignedIn(scrobbler_session));
+                                waker.wake();
+                            }
+                            Err(error) => {
+                                let _ = events.send(Event::LastFmSignInFailed(error.to_string()));
+                                waker.wake();
+                            }
+                        }
+                    });
+                }
+                Command::LastFmNowPlaying { now } => {
+                    let scrobbler = self.scrobbler.clone();
+                    if scrobbler.session().is_none() {
+                        return;
+                    }
+                    let artist = now.artist.clone();
+                    let track = now.track.clone();
+                    let album = now.album.clone();
+                    let duration = now.duration;
+                    tokio::spawn(async move {
+                        let _ = scrobbler
+                            .now_playing(&crate::lastfm::NowPlaying {
+                                artist,
+                                track,
+                                album,
+                                duration,
+                            })
+                            .await;
+                    });
+                }
+                Command::LastFmScrobble { track } => {
+                    let scrobbler = self.scrobbler.clone();
+                    if scrobbler.session().is_none() {
+                        return;
+                    }
+                    let artist = track.artist.clone();
+                    let track_name = track.track.clone();
+                    let album = track.album.clone();
+                    let duration = track.duration;
+                    let timestamp = track.timestamp;
+                    tokio::spawn(async move {
+                        let _ = scrobbler.scrobble(&crate::lastfm::Scrobble {
+                            artist,
+                            track: track_name,
+                            album,
+                            duration,
+                            timestamp,
+                        }).await;
+                    });
+                }
                 Command::CheckPlaylistCover {
                     id,
                     request,
@@ -2911,6 +3094,41 @@ impl Worker {
         }
     }
 
+    /// Restore a stored Last.fm session, independent of Spotify sign-in.
+    fn restore_lastfm(&mut self) {
+        let lease = self.credentials.lease(CredentialSlot::LastFm);
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = lease.load().await;
+            let _ = commands.send(Command::LastFmRestored { lease, result });
+        });
+    }
+
+    fn on_lastfm_restored(
+        &mut self,
+        lease: CredentialLease,
+        result: Result<crate::credentials::Loaded, crate::credentials::Error>,
+    ) {
+        if !lease.current() {
+            return;
+        }
+        match result {
+            Ok(loaded) => {
+                if let Some(error) = loaded.warning {
+                    self.emit(Event::Error(error.to_string()));
+                }
+                if let Some(crate::credentials::Grant::LastFm(session)) = loaded.grant {
+                    self.scrobbler.set_session(crate::lastfm::Session {
+                        api_key: session.api_key,
+                        session_key: session.session_key,
+                        secret: session.secret,
+                    });
+                }
+            }
+            Err(error) => self.emit(Event::Error(error.to_string())),
+        }
+    }
+
     fn on_credentials_restored(
         &mut self,
         slot: CredentialSlot,
@@ -2970,7 +3188,7 @@ impl Worker {
                     }
                 }
             }
-            None | Some(StoredGrant::Proxy(_)) => {}
+            None | Some(StoredGrant::Proxy(_)) | Some(StoredGrant::LastFm(_)) => {}
         }
         if slot == CredentialSlot::Playback {
             self.start_prerelease();

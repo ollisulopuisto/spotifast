@@ -55,6 +55,35 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 }
+                Dialog::LastFmSignIn { mut api_key, auth_url } => {
+                    theme::text(ui, gettext(locale, "Sign in to Last.fm"), theme::bold(20.0), palette.text);
+                    ui.add_space(12.0);
+                    ui.add(egui::Label::new(egui::RichText::new(gettext(locale, "Open Last.fm in your browser and allow Spotifast to scrobble your plays. Then come back and confirm below.")).font(theme::regular(14.0)).color(palette.secondary)).wrap());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(gettext(locale, "API key:"));
+                        let mut api_key_value = api_key.clone();
+                        ui.text_edit_singleline(&mut api_key_value);
+                        api_key = api_key_value;
+                    });
+                    ui.add_space(8.0);
+                    if theme::pill_button(ui, &palette, &gettext(locale, "Open Last.fm"), false).clicked() {
+                        app.actions.push(Action::OpenUrl(auth_url.clone()));
+                    }
+                    ui.add_space(10.0);
+                    buttons(ui, |ui| {
+                        if theme::pill_button(ui, &palette, &gettext(locale, "I've authorized"), true).clicked() {
+                            if let Some((_, _, token)) = app.lastfm_sign_in_pending.take() {
+                                app.backend.lastfm_exchange_token(token);
+                            }
+                            app.actions.push(Action::CloseDialog);
+                        }
+                        if theme::pill_button(ui, &palette, &gettext(locale, "Cancel"), false).clicked() {
+                            app.lastfm_sign_in_pending = None;
+                            app.actions.push(Action::CloseDialog);
+                        }
+                    });
+                }
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {

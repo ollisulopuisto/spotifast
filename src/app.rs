@@ -569,6 +569,11 @@ pub struct App {
     accent_pending: HashSet<String>,
 
     pub dialog: Option<Dialog>,
+    /// A Last.fm sign-in waiting for the listener to authorize in the browser:
+    /// the API key, secret, and token returned by `auth.getToken`.
+    pub(crate) lastfm_sign_in_pending: Option<(String, String, String)>,
+    /// Whether the listener is signed in to Last.fm, so plays can be scrobbled.
+    lastfm_signed_in: bool,
     cover_request: u64,
     cover_uploads: HashMap<String, u64>,
     /// Successful uploads stay visible while Spotify propagates the new image.
@@ -638,6 +643,10 @@ pub struct App {
     #[cfg(feature = "milkdrop")]
     milkdrop_host: Option<crate::milkdrop::host::Host>,
     last_eviction: Instant,
+    /// Last time egui's texture atlas was trimmed of unused glyphs and
+    /// images. Trimmed while the window is hidden, so visible frames never
+    /// pay for it.
+    last_texture_reduction: Instant,
     /// Playback snapshot for the current frame, built once per redraw.
     frame_now: Option<NowPlaying>,
     pub sign_in_url: Option<String>,
@@ -1197,6 +1206,8 @@ impl App {
             art_palettes: HashMap::new(),
             accent_pending: HashSet::new(),
             dialog: None,
+            lastfm_sign_in_pending: None,
+            lastfm_signed_in: false,
             cover_request: 0,
             cover_uploads: HashMap::new(),
             uploaded_covers: Default::default(),
@@ -1240,6 +1251,7 @@ impl App {
             #[cfg(feature = "milkdrop")]
             milkdrop_host: None,
             last_eviction: Instant::now(),
+            last_texture_reduction: Instant::now(),
             frame_now: None,
             sign_in_url: None,
             web_app: None,
@@ -1349,6 +1361,11 @@ impl App {
     /// Per-window setup: fonts, icons, loaders, theme. Called every time a
     /// window is (re)created around this long-lived application state.
     pub fn attach(&mut self, ctx: &egui::Context) {
+        // Discard image source bytes once their textures are on the GPU: the
+        // covers come from the disk cache, so the source bytes need not stay
+        // in RAM. This keeps browsing from piling up gigabytes of decoded
+        // image data in the process.
+        ctx.options_mut(|options| options.reduce_texture_memory = true);
         theme::install(ctx);
         ctx.add_bytes_loader(std::sync::Arc::new(self.backend.art().clone()));
         ctx.add_image_loader(std::sync::Arc::new(self.backend.art().scaler()));
@@ -1415,6 +1432,11 @@ impl App {
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
         self.winamp.forget_textures();
+        // The window's textures are no longer needed: drop them from the
+        // atlas now rather than waiting for the next idle trim.
+        // (reduce_texture_memory is called on the egui context by the
+        // caller's next frame; here we just reset the timer so it runs soon.)
+        self.last_texture_reduction = Instant::now() - Duration::from_secs(31);
         self.window_hidden = true;
         self.hide_intent = false;
         self.wants_show = false;
@@ -2577,6 +2599,13 @@ impl App {
                     result,
                 } => self.handle_proxy_applied(request, config, result),
                 Event::Error(message) => self.toast_error(message),
+                Event::LastFmToken {
+                    api_key,
+                    secret,
+                    token,
+                } => self.handle_lastfm_token(api_key, secret, token),
+                Event::LastFmSignedIn(session) => self.handle_lastfm_signed_in(session),
+                Event::LastFmSignInFailed(message) => self.handle_lastfm_sign_in_failed(message),
                 Event::Rootlist { result } => match result {
                     Ok(rootlist) => {
                         let account_id = self.user_id().map(str::to_owned).or_else(|| {
@@ -3919,6 +3948,17 @@ impl App {
             self.backend.art().evict(ctx);
             self.evict_stale_pages();
         }
+        // The egui texture atlas (glyphs and cover textures) grows with every
+        // distinct piece of text and every cover the interface ever shows and
+        // is never shrunk on its own: egui only trims it on a memory warning.
+        // Trim it while the window is hidden, so the process does not hold
+        // onto a gigabyte of rasterised glyphs it is not showing.
+        if self.window_hidden && self.last_texture_reduction.elapsed() > Duration::from_secs(30) {
+            self.last_texture_reduction = now;
+            // Drop covers the UI no longer references while the window is
+            // hidden, so the process does not hold onto them.
+            self.backend.art().evict(ctx);
+        }
         self.sync_skin(ctx);
         if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
             self.save_settings();
@@ -4181,6 +4221,38 @@ impl App {
             self.settings.proxy_password_legacy = false;
             self.save_settings();
         }
+    }
+
+    /// A Last.fm token arrived: remember the pending sign-in and tell the
+    /// listener to authorize in the browser.
+    fn handle_lastfm_token(
+        &mut self,
+        api_key: String,
+        secret: String,
+        token: String,
+    ) {
+        self.lastfm_sign_in_pending = Some((api_key.clone(), secret, token.clone()));
+        let url = crate::lastfm::Scrobbler::auth_url(&api_key, &token);
+        self.dialog = Some(crate::model::Dialog::LastFmSignIn {
+            api_key,
+            auth_url: url,
+        });
+    }
+
+    /// The Last.fm sign-in completed: store the session and clear the dialog.
+    fn handle_lastfm_signed_in(&mut self, _session: crate::lastfm::Session) {
+        self.lastfm_sign_in_pending = None;
+        self.lastfm_signed_in = true;
+        self.dialog = None;
+        self.save_settings();
+        self.toast(gettext(self.locale, "Signed in to Last.fm"));
+    }
+
+    /// The Last.fm sign-in failed: show why and clear the pending state.
+    fn handle_lastfm_sign_in_failed(&mut self, message: String) {
+        self.lastfm_sign_in_pending = None;
+        self.dialog = None;
+        self.toast_error(message);
     }
 
     fn request_proxy(&mut self, sign_in: bool) {
@@ -12865,6 +12937,23 @@ impl App {
             .record(crate::history::played_track(&now), jiff::Timestamp::now());
         self.plays.save(&self.files, &self.dirs.history_file());
         self.rebuild_recents();
+        if !now.is_episode
+            && now.duration_ms > 0
+            && self.lastfm_signed_in
+        {
+            let artists: Vec<String> = now
+                .artists
+                .iter()
+                .map(|artist| artist.name.clone())
+                .collect();
+            self.backend.lastfm_scrobble(crate::lastfm::Scrobble {
+                artist: artists.join(", "),
+                track: now.title.clone(),
+                album: (!now.album_name.is_empty()).then_some(now.album_name.clone()),
+                duration: now.duration_ms / 1000,
+                timestamp: crate::lastfm::now(),
+            });
+        }
     }
 
     /// Puts Spotifast in the Dock or takes it out, as Settings asks, on a
