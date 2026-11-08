@@ -20,10 +20,17 @@ def quote(value):
 
 
 def child_env():
-    return {k: v for k, v in os.environ.items() if k not in {
-        "KEYCHAIN_PASSWORD", "P12_PASSWORD", "APPLE_APP_PASSWORD",
-        "BUILD_CERTIFICATE_BASE64",
-    }}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in {
+            "KEYCHAIN_PASSWORD",
+            "P12_PASSWORD",
+            "APPLE_APP_PASSWORD",
+            "BUILD_CERTIFICATE_BASE64",
+        }
+    }
 
 
 def security(*args):
@@ -32,8 +39,12 @@ def security(*args):
     # Fail closed on all diagnostics; never print secret-bearing input/output.
     line = " ".join(quote(a) for a in args) + "\n"
     result = subprocess.run(
-        ["/usr/bin/security", "-i"], input=line, text=True,
-        capture_output=True, env=child_env(), check=False,
+        ["/usr/bin/security", "-i"],
+        input=line,
+        text=True,
+        capture_output=True,
+        env=child_env(),
+        check=False,
     )
     if result.returncode or (result.stderr or "").strip():
         raise RuntimeError("Keychain operation failed (output withheld)")
@@ -46,7 +57,12 @@ def parse_keychain_list(output):
         value = line.strip()
         if not value:
             continue
-        if len(value) < 3 or not value.startswith('"/') or not value.endswith('"') or "\x00" in value:
+        if (
+            len(value) < 3
+            or not value.startswith('"/')
+            or not value.endswith('"')
+            or "\x00" in value
+        ):
             raise RuntimeError("Unexpected keychain search list output (withheld)")
         paths.append(value[1:-1])
     return paths
@@ -59,10 +75,25 @@ def import_certificate():
     security("create-keychain", "-p", password, keychain)
     security("set-keychain-settings", "-lut", "21600", keychain)
     security("unlock-keychain", "-p", password, keychain)
-    security("import", os.environ["CERTIFICATE_PATH"], "-P",
-             os.environ["P12_PASSWORD"], "-T", "/usr/bin/codesign", "-k", keychain)
-    security("set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
-             "-s", "-k", password, keychain)
+    security(
+        "import",
+        os.environ["CERTIFICATE_PATH"],
+        "-P",
+        os.environ["P12_PASSWORD"],
+        "-T",
+        "/usr/bin/codesign",
+        "-k",
+        keychain,
+    )
+    security(
+        "set-key-partition-list",
+        "-S",
+        "apple-tool:,apple:,codesign:",
+        "-s",
+        "-k",
+        password,
+        keychain,
+    )
     current = parse_keychain_list(security("list-keychains", "-d", "user"))
     paths = list(dict.fromkeys([*original, *current, keychain]))
     security("list-keychains", "-d", "user", "-s", *paths)
@@ -73,16 +104,25 @@ def store_notary_credentials():
     # a real TTY (getpass can use /dev/tty), with echo disabled before spawning.
     password = os.environ["APPLE_APP_PASSWORD"]
     quote(password)  # Refuse multiline input before interacting with a prompt.
-    command = ["xcrun", "notarytool", "store-credentials", os.environ.get("NOTARY_PROFILE", "native-packages"),
-               "--apple-id", os.environ["APPLE_ID"], "--team-id",
-               os.environ["APPLE_TEAM_ID"], "--keychain", os.environ["KEYCHAIN_PATH"]]
+    command = [
+        "xcrun",
+        "notarytool",
+        "store-credentials",
+        os.environ.get("NOTARY_PROFILE", "native-packages"),
+        "--apple-id",
+        os.environ["APPLE_ID"],
+        "--team-id",
+        os.environ["APPLE_TEAM_ID"],
+        "--keychain",
+        os.environ["KEYCHAIN_PATH"],
+    ]
     pid, master = pty.fork()
     if pid == 0:
         attrs = termios.tcgetattr(0)
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(0, termios.TCSANOW, attrs)
         # Fixed notarytool command; no shell or secret-bearing argument.
-        os.execvpe(command[0], command, child_env())  # noqa: S606
+        os.execvpe(command[0], command, child_env())
     output = b""
     sent = False
     status = None
