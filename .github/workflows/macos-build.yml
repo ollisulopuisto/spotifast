@@ -14,7 +14,7 @@ on:
       - 'build.rs'
       - 'packaging/macos/bundle.sh'
       - 'packaging/macos/dmg.rb'
-      - '.github/workflows/macos-build.yml' 
+      - '.github/workflows/macos-build.yml'
 
 env:
   CARGO_TERM_COLOR: always
