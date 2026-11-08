@@ -2,7 +2,6 @@
 
 import importlib.util
 import os
-import shlex
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +22,28 @@ def checked(condition):
 
 
 class NativeKeychainTransportTests(unittest.TestCase):
+    def test_notary_private_tty_prompt(self):
+        with tempfile.TemporaryDirectory(prefix="notary prompt smoke ") as directory:
+            folder = Path(directory)
+            executable = folder / "xcrun"
+            marker = folder / "passed"
+            executable.write_text(
+                '#!/usr/bin/env python3\n'
+                'import getpass, os, pathlib, sys, termios\n'
+                'if "--password" in sys.argv or "APPLE_APP_PASSWORD" in os.environ: raise SystemExit(4)\n'
+                'if termios.tcgetattr(0)[3] & termios.ECHO: raise SystemExit(6)\n'
+                'value = getpass.getpass("App-specific password: ")\n'
+                'if value != "dummy-apple": raise SystemExit(5)\n'
+                'pathlib.Path(os.environ["TEST_MARKER"]).write_text("passed")\n')
+            executable.chmod(0o700)
+            env = {"PATH": str(folder) + os.pathsep + os.environ["PATH"],
+                   "APPLE_APP_PASSWORD": "dummy-apple", "APPLE_ID": "test@example.invalid",
+                   "APPLE_TEAM_ID": "DUMMYTEAM", "KEYCHAIN_PATH": str(folder / "dummy"),
+                   "TEST_MARKER": str(marker)}
+            with patch.dict(os.environ, env):
+                HELPER.store_notary_credentials()
+            checked(marker.read_text() == "passed")
+
     def test_create_unlock_import_partition_and_delete(self):
         with tempfile.TemporaryDirectory(prefix="spotifast signing smoke ") as directory:
             folder = Path(directory)
@@ -61,8 +82,10 @@ class NativeKeychainTransportTests(unittest.TestCase):
                     capture_output=True, check=True,
                 )
                 checked(b"Solmu transport smoke test" in result.stdout)
-                current = shlex.split(HELPER.security("list-keychains", "-d", "user"))
-                checked(set(shlex.split(original)).issubset(current))
+                current_result = subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user"], capture_output=True, text=True, check=True)
+                current = HELPER.parse_keychain_list(current_result.stdout)
+                checked(str(keychain) in current)
+                checked(set(HELPER.parse_keychain_list(original)).issubset(current))
                 # Prove the password was not silently truncated by -i quoting.
                 HELPER.security("lock-keychain", str(keychain))
                 with self.assertRaises(RuntimeError):  # noqa: PT027 - standalone stdlib runner
