@@ -244,7 +244,7 @@ jobs:
 
       - name: Package, sign and notarize macOS app
         run: |
-          native-packages build \
+          ruby packaging/macos/secure_native_packages.rb build \
             --version "${GITHUB_REF_NAME#v}" --target macos-universal --defer-recipes \
             --output "$RUNNER_TEMP/macos-packages"
           cp "$RUNNER_TEMP/macos-packages/packages/macos-universal/dmg/"*.dmg dist/

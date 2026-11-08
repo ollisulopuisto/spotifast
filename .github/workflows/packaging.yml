@@ -5,7 +5,15 @@ on:
     branches: [main, master]
     paths: [native-packages.yaml, packaging/**, contrib/omarchy/**, .github/workflows/packaging.yml, .github/workflows/release.yml]
   pull_request:
-    paths: [native-packages.yaml, packaging/**, contrib/omarchy/**, .github/workflows/packaging.yml, .github/workflows/release.yml]
+    paths:
+      - native-packages.yaml
+      - packaging/**
+      - '!packaging/macos/credential_transport.rb'
+      - '!packaging/macos/secure_native_packages.rb'
+      - '!packaging/macos/macos_ci_credentials.py'
+      - '!packaging/macos/test_credential_transport.rb'
+      - contrib/omarchy/**
+      - .github/workflows/packaging.yml
   workflow_dispatch:
     inputs:
       version:
@@ -38,7 +46,22 @@ permissions:
   contents: read
 
 jobs:
+  changed-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.scope.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 packaging/macos/select_release_checks.py >> "$GITHUB_OUTPUT"
   packaging:
+    needs: changed-inputs
+    if: needs.changed-inputs.outputs.package == 'true'
     permissions:
       contents: write
     uses: crmne/native-packages/.github/workflows/package.yml@226fb48cb375c7cb309a3e642c7228a6e00e9ebf # v0.10.0

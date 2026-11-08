@@ -6,12 +6,36 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'assets/**'
+      - 'build.rs'
+      - 'packaging/macos/bundle.sh'
+      - 'packaging/macos/dmg.rb'
+      - '.github/workflows/macos-build.yml'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changed-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.scope.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 packaging/macos/select_release_checks.py >> "$GITHUB_OUTPUT"
   build:
+    needs: changed-inputs
+    if: needs.changed-inputs.outputs.package == 'true'
     name: Build and package macOS DMG
     runs-on: macos-15
     timeout-minutes: 60
