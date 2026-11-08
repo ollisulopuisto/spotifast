@@ -42,7 +42,7 @@ def security(*args):
 
 def parse_keychain_list(output):
     paths = []
-    for line in output.splitlines():
+    for line in output.split("\n"):
         value = line.strip()
         if not value:
             continue
